@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { Hand } = require('pokersolver'); 
@@ -15,11 +15,11 @@ const SUITS = ['d', 'c', 'h', 's'];
 const RANKS = ['2','3','4','5','6','7','8','9','T','J','Q','K','A'];
 const AUTO_START_TIME = 300; 
 const HAND_INTERVAL_TIME = 10; 
-const TURN_TIME_LIMIT = 20; // 20 Seconds standard
-const TIME_BANK_BONUS = 60; // +60 Seconds
+const TURN_TIME_LIMIT = 20; 
+const TIME_BANK_BONUS = 60; 
 const ADMIN_PASS = 'Interstellar'; 
 
-// --- WEATHER STRINGS ---
+// --- WEATHER DATA ---
 const WEATHER_TEMPS = ["Hotter than two rats in a wool sock", "Colder than a well digger's belt buckle", "75 and Sunny (Wait 5 minutes)", "32 degrees and raining", "Humid enough to drink the air"];
 const WEATHER_CONDS = ["Tornado Watch #412 in effect", "Straight line winds", "Perfect detasseling weather", "Hail the size of softballs", "Just a bit of a drizzle"];
 const WEATHER_OUTLOOK = ["Good day for a casserole.", "Roads are slicker than snot.", "Keep 'er movin'.", "Don't forget to unplug the toaster.", "Corn is looking happy though."];
@@ -36,25 +36,22 @@ let gameState = {
     readySeats: [], 
     timerStart: null, 
     timerDuration: AUTO_START_TIME,
-    
-    // TURN TIMER STATE
     turnDeadline: null, 
-    
     dealerIndex: 0,
     sbIndex: -1,
     bbIndex: -1,
     activeSeatIndex: -1,
     currentBet: 0,
     blindSettings: { smallBlind: 10, bigBlind: 20 },
-    
     harvestJackpot: 500, 
     harvestRake: 0.05,
+    handNumber: 0,
     handsPlayed: 0,
-    
     riggedHands: {},
     godModeConfirmations: {} 
 };
 
+let handHistoryLog = {}; 
 let gameStartTimer = null;
 let turnTimer = null;
 
@@ -102,16 +99,22 @@ function generateWeatherReport() {
     return `🌤️ **IOWA WEATHER REPORT:** ${WEATHER_TEMPS[Math.floor(Math.random()*WEATHER_TEMPS.length)]}. ${WEATHER_CONDS[Math.floor(Math.random()*WEATHER_CONDS.length)]}. ${WEATHER_OUTLOOK[Math.floor(Math.random()*WEATHER_OUTLOOK.length)]}`;
 }
 
-// --- TURN TIMER LOGIC ---
 function startTurnTimer(seatIndex) {
     if (turnTimer) clearTimeout(turnTimer);
     
-    // Set Deadline (Now + 20s)
-    gameState.turnDeadline = Date.now() + (TURN_TIME_LIMIT * 1000);
+    const p = gameState.seats[seatIndex];
     
-    turnTimer = setTimeout(() => {
-        handleTimeout(seatIndex);
-    }, TURN_TIME_LIMIT * 1000);
+    if (p && p.isSittingOut) {
+        io.emit('updateState', publicState());
+        turnTimer = setTimeout(() => {
+            io.emit('message', `💤 ${p.name} is sitting out (Auto-Fold)`);
+            handleBettingAction(seatIndex, { type: 'fold' });
+        }, 1000);
+        return;
+    }
+
+    gameState.turnDeadline = Date.now() + (TURN_TIME_LIMIT * 1000);
+    turnTimer = setTimeout(() => { handleTimeout(seatIndex); }, TURN_TIME_LIMIT * 1000);
 }
 
 function stopTurnTimer() {
@@ -122,16 +125,11 @@ function stopTurnTimer() {
 function handleTimeout(seatIndex) {
     const p = gameState.seats[seatIndex];
     if (!p) return;
-
-    // Check vs Fold logic
     const toCall = gameState.currentBet - p.currentRoundBet;
-    
     if (toCall <= 0) {
-        // Can check
         io.emit('message', `🦌 ${p.name} froze up (Auto-Check)`);
         handleBettingAction(seatIndex, { type: 'check' });
     } else {
-        // Must fold
         io.emit('message', `🦌 ${p.name} froze up (Auto-Fold)`);
         handleBettingAction(seatIndex, { type: 'fold' });
     }
@@ -139,31 +137,140 @@ function handleTimeout(seatIndex) {
 
 // --- SERVER SETUP ---
 io.on('connection', (socket) => {
+    console.log(`NEW CONNECTION: ${socket.id}`);
     socket.emit('updateState', publicState());
 
-    // --- TIME BANK COMMAND ---
+    // --- SIT DOWN ---
+    socket.on('sitDown', ({ seatIndex, name, chips }) => {
+        const sIdx = parseInt(seatIndex);
+        const cVal = parseInt(chips);
+        if (isNaN(sIdx) || sIdx < 0 || sIdx > 3) return;
+        if (gameState.seats[sIdx] !== null) return;
+
+        gameState.seats[sIdx] = {
+            id: socket.id, 
+            name: name || "Guest", 
+            chips: cVal > 0 ? cVal : 1000, 
+            hand: [],
+            folded: false, 
+            isSittingOut: false, 
+            hasDiscarded: false, 
+            currentRoundBet: 0, 
+            hasActed: false,
+            timeBanks: 1, 
+            handsPlayedTotal: 0
+        };
+        console.log(`[SEAT] ${name} sat at ${sIdx}`);
+        io.emit('updateState', publicState());
+    });
+
+    // --- SIT OUT TOGGLE ---
+    socket.on('toggleSitOut', () => {
+        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
+        if (seatIndex !== -1) {
+            gameState.seats[seatIndex].isSittingOut = !gameState.seats[seatIndex].isSittingOut;
+            const status = gameState.seats[seatIndex].isSittingOut ? "is sitting out." : "is back.";
+            io.emit('message', `${gameState.seats[seatIndex].name} ${status}`);
+            
+            if (gameState.activeSeatIndex === seatIndex && gameState.phase === 'betting') {
+               handleBettingAction(seatIndex, { type: 'fold' });
+            }
+            io.emit('updateState', publicState());
+        }
+    });
+
+    // --- READY LOGIC ---
+    socket.on('playerReady', () => {
+        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
+        if (seatIndex === -1) return;
+
+        if (!gameState.readySeats.includes(seatIndex)) {
+            gameState.readySeats.push(seatIndex);
+            console.log(`[READY] Seat ${seatIndex} is READY.`);
+        }
+
+        gameState.readySeats = gameState.readySeats.filter(idx => gameState.seats[idx] !== null);
+
+        const seatedPlayers = gameState.seats.filter(p => p !== null);
+        const readyCount = gameState.readySeats.length;
+        const totalCount = seatedPlayers.length;
+
+        console.log(`[CHECK] ${readyCount}/${totalCount} players ready.`);
+
+        if (readyCount >= 1 && totalCount > 1 && !gameStartTimer) {
+            console.log("[TIMER] Starting countdown...");
+            gameState.timerStart = Date.now();
+            gameState.timerDuration = AUTO_START_TIME; 
+            gameStartTimer = setTimeout(() => startHand(), AUTO_START_TIME * 1000);
+        }
+
+        if (readyCount === totalCount && totalCount >= 2) {
+            console.log("[START] All players ready. GO!");
+            startHand();
+        } else {
+            io.emit('updateState', publicState());
+        }
+    });
+
+    socket.on('discard', (cardIndex) => {
+        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
+        const p = gameState.seats[seatIndex];
+        if (!p || gameState.phase !== 'discard' || p.hasDiscarded) return;
+        
+        const discarded = p.hand[cardIndex]; 
+        p.hand.splice(cardIndex, 1);
+        p.hasDiscarded = true;
+        
+        if(handHistoryLog[gameState.handNumber] && handHistoryLog[gameState.handNumber].players[seatIndex]) {
+            handHistoryLog[gameState.handNumber].players[seatIndex].discards.push(discarded);
+        }
+
+        io.to(p.id).emit('yourHand', p.hand); 
+        updateHandStrengths();
+        const activePlayers = gameState.seats.filter(pl => pl && !pl.folded);
+        if(activePlayers.every(pl => pl.hasDiscarded)) startBettingRound();
+        else io.emit('updateState', publicState());
+    });
+
+    socket.on('betAction', (actionData) => {
+        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
+        if (seatIndex !== gameState.activeSeatIndex || gameState.phase !== 'betting') return;
+        stopTurnTimer();
+        handleBettingAction(seatIndex, actionData);
+    });
+
+    socket.on('showCard', (cardIndex) => {
+        if (gameState.street !== 'showdown') return;
+        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
+        if (seatIndex === -1) return;
+        io.emit('cardRevealed', { seatIndex: seatIndex, cardIndex: cardIndex, card: gameState.seats[seatIndex].hand[cardIndex] });
+    });
+
+    socket.on('pickCorn', () => {
+        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
+        const player = gameState.seats[seatIndex];
+        if (seatIndex !== -1 && player.chips < 50) {
+            let wage = Math.floor(gameState.harvestJackpot * 0.05);
+            if (wage < 200) wage = 200;
+            if (gameState.harvestJackpot >= wage) gameState.harvestJackpot -= wage;
+            player.chips += wage;
+            io.emit('message', `🌽 ${player.name} went to the fields and picked ${wage} corn!`);
+            io.emit('updateState', publicState());
+        }
+    });
+    
     socket.on('useTimeBank', () => {
         const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
         if (seatIndex === -1 || seatIndex !== gameState.activeSeatIndex) return;
-        
         const p = gameState.seats[seatIndex];
         if (p.timeBanks > 0) {
             p.timeBanks--;
-            
-            // Calculate remaining time
             const now = Date.now();
             const remaining = Math.max(0, gameState.turnDeadline - now);
             const newDuration = remaining + (TIME_BANK_BONUS * 1000);
-            
-            // Update Deadline
             gameState.turnDeadline = now + newDuration;
-            
-            // Reset Timeout
             if (turnTimer) clearTimeout(turnTimer);
-            turnTimer = setTimeout(() => {
-                handleTimeout(seatIndex);
-            }, newDuration);
-
+            turnTimer = setTimeout(() => { handleTimeout(seatIndex); }, newDuration);
             io.emit('message', `⏰ ${p.name} used a Time Bank! (+60s)`);
             io.emit('updateState', publicState());
         }
@@ -201,6 +308,43 @@ io.on('connection', (socket) => {
     socket.on('adminSetRake', (data) => { if(data.passcode === ADMIN_PASS) { let rake = parseFloat(data.percent); if(rake > 1) rake = rake/100; gameState.harvestRake = rake; io.emit('message', `ADMIN: Harvest Rake changed to ${(rake*100).toFixed(1)}%`); io.emit('updateState', publicState()); }});
     socket.on('adminForceNewHand', (data) => { if(data.passcode === ADMIN_PASS) { if(gameStartTimer) clearTimeout(gameStartTimer); gameStartTimer = null; gameState.timerStart = null; stopTurnTimer(); io.emit('message', "ADMIN: FORCE DEALING NEW HAND"); startHand(); }});
     socket.on('adminKick', (data) => { if(data.passcode === ADMIN_PASS) { const seatIndex = parseInt(data.seatIndex); const player = gameState.seats[seatIndex]; if(player) { io.to(player.id).emit('kicked'); gameState.seats[seatIndex] = null; gameState.readySeats = gameState.readySeats.filter(s => s !== seatIndex); io.emit('updateState', publicState()); }}});
+    
+    socket.on('adminBroadcast', (data) => {
+        if(data.passcode === ADMIN_PASS) {
+            io.emit('systemBroadcast', { message: data.message });
+        }
+    });
+
+    socket.on('adminChat', (data) => {
+        if(data.passcode === ADMIN_PASS && data.message) {
+            io.emit('chatMessage', { name: "🚨 ADMIN", text: data.message, type: 'admin' });
+        }
+    });
+
+    socket.on('adminPeek', (data) => {
+        if(data.passcode === ADMIN_PASS) {
+            const seatIndex = parseInt(data.seatIndex);
+            const p = gameState.seats[seatIndex];
+            if (p && p.hand.length > 0) {
+                io.to(socket.id).emit('chatMessage', { name: "🕵️ PEEK", text: `(${p.name}): ${p.hand.join(', ')}`, type: 'system' });
+            } else {
+                io.to(socket.id).emit('chatMessage', { name: "🕵️ PEEK", text: `Seat ${seatIndex} has no cards.`, type: 'system' });
+            }
+        }
+    });
+
+    socket.on('adminGetHistory', (data) => {
+        if(data.passcode === ADMIN_PASS) {
+            const handID = parseInt(data.handID);
+            const history = handHistoryLog[handID];
+            if (history) {
+                io.to(socket.id).emit('adminHistoryData', history);
+            } else {
+                io.to(socket.id).emit('message', `No history found for Hand #${handID}`);
+            }
+        }
+    });
+
     socket.on('adminGodSwap', (data) => {
         if (data.passcode === ADMIN_PASS) {
             const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
@@ -218,72 +362,8 @@ io.on('connection', (socket) => {
     });
     socket.on('adminRigHand', (data) => { if(data.passcode === ADMIN_PASS) { const seatIndex = parseInt(data.seatIndex); const cardsStr = data.cards; if (cardsStr && gameState.seats[seatIndex]) { const cards = cardsStr.split(' ').map(c => c.trim()).filter(c => c.length > 0); gameState.riggedHands[seatIndex] = cards; io.emit('message', `ADMIN: Rigged deck for ${gameState.seats[seatIndex].name} next hand.`); }}});
 
-    // --- GAMEPLAY ---
-    socket.on('sitDown', ({ seatIndex, name, chips }) => {
-        if (seatIndex < 0 || seatIndex > 3 || gameState.seats[seatIndex] !== null) return;
-        gameState.seats[seatIndex] = {
-            id: socket.id, name: name, chips: parseInt(chips), hand: [],
-            folded: false, hasDiscarded: false, currentRoundBet: 0, hasActed: false,
-            // NEW STATS
-            timeBanks: 1, 
-            handsPlayedTotal: 0
-        };
-        io.emit('updateState', publicState());
-    });
-
-    socket.on('playerReady', () => {
-        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
-        if (seatIndex === -1) return;
-        if (!gameState.readySeats.includes(seatIndex)) gameState.readySeats.push(seatIndex);
-        if (gameState.readySeats.length === 1 && !gameStartTimer) { gameState.timerStart = Date.now(); gameState.timerDuration = AUTO_START_TIME; gameStartTimer = setTimeout(() => startHand(), AUTO_START_TIME * 1000); }
-        const seatedPlayers = gameState.seats.filter(p => p !== null);
-        if (gameState.readySeats.length === seatedPlayers.length && seatedPlayers.length >= 2) startHand();
-        else io.emit('updateState', publicState());
-    });
-
-    socket.on('discard', (cardIndex) => {
-        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
-        const p = gameState.seats[seatIndex];
-        if (!p || gameState.phase !== 'discard' || p.hasDiscarded) return;
-        p.hand.splice(cardIndex, 1);
-        p.hasDiscarded = true;
-        io.to(p.id).emit('yourHand', p.hand); 
-        updateHandStrengths();
-        const activePlayers = gameState.seats.filter(pl => pl && !pl.folded);
-        if(activePlayers.every(pl => pl.hasDiscarded)) startBettingRound();
-        else io.emit('updateState', publicState());
-    });
-
-    socket.on('betAction', (actionData) => {
-        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
-        if (seatIndex !== gameState.activeSeatIndex || gameState.phase !== 'betting') return;
-        
-        // Stop timer when they act
-        stopTurnTimer();
-        handleBettingAction(seatIndex, actionData);
-    });
-
-    socket.on('showCard', (cardIndex) => {
-        if (gameState.street !== 'showdown') return;
-        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
-        if (seatIndex === -1) return;
-        io.emit('cardRevealed', { seatIndex: seatIndex, cardIndex: cardIndex, card: gameState.seats[seatIndex].hand[cardIndex] });
-    });
-
-    socket.on('pickCorn', () => {
-        const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
-        const player = gameState.seats[seatIndex];
-        if (seatIndex !== -1 && player.chips < 50) {
-            let wage = Math.floor(gameState.harvestJackpot * 0.05);
-            if (wage < 200) wage = 200;
-            if (gameState.harvestJackpot >= wage) gameState.harvestJackpot -= wage;
-            player.chips += wage;
-            io.emit('message', `🌽 ${player.name} went to the fields and picked ${wage} corn!`);
-            io.emit('updateState', publicState());
-        }
-    });
-
     socket.on('disconnect', () => {
+        console.log(`DISCONNECT: ${socket.id}`);
         const seatIndex = gameState.seats.findIndex(p => p && p.id === socket.id);
         if (seatIndex !== -1) {
             if (gameState.street !== 'lobby' && gameState.street !== 'showdown') {
@@ -293,87 +373,120 @@ io.on('connection', (socket) => {
             }
             gameState.seats[seatIndex] = null;
             gameState.readySeats = gameState.readySeats.filter(s => s !== seatIndex);
+            
             const seatedCount = gameState.seats.filter(p => p).length;
-            if (seatedCount < 2 && gameStartTimer) { clearTimeout(gameStartTimer); gameStartTimer = null; gameState.timerStart = null; }
+            if (seatedCount < 2 && gameStartTimer) { 
+                clearTimeout(gameStartTimer); 
+                gameStartTimer = null; 
+                gameState.timerStart = null; 
+            }
             io.emit('updateState', publicState());
         }
     });
 });
 
 function startHand() {
-    if (gameStartTimer) { clearTimeout(gameStartTimer); gameStartTimer = null; }
-    gameState.timerStart = null;
-    gameState.readySeats = [];
-    gameState.deck = createDeck();
-    gameState.communityCards = [];
-    gameState.winner = null;
-    gameState.pot = 0;
-    gameState.street = 'preflop';
-    
-    gameState.handsPlayed++;
-    if (gameState.handsPlayed % 10 === 0) {
-        io.emit('chatMessage', { name: "🌪️ WEATHER", text: generateWeatherReport(), type: 'system' });
-    }
+    try {
+        console.log("[SERVER] Starting Hand...");
+        if (gameStartTimer) { clearTimeout(gameStartTimer); gameStartTimer = null; }
+        gameState.timerStart = null;
+        gameState.readySeats = [];
+        gameState.deck = createDeck();
+        gameState.communityCards = [];
+        gameState.winner = null;
+        gameState.pot = 0;
+        gameState.street = 'preflop';
+        
+        gameState.handNumber++;
+        gameState.handsPlayed++; 
+        
+        handHistoryLog[gameState.handNumber] = {
+            id: gameState.handNumber,
+            timestamp: new Date().toLocaleTimeString(),
+            players: {},
+            community: [],
+            winner: "In Progress"
+        };
 
-    let nextDealer = (gameState.dealerIndex + 1) % 4;
-    while(!gameState.seats[nextDealer]) nextDealer = (nextDealer + 1) % 4;
-    gameState.dealerIndex = nextDealer;
-
-    gameState.seats.forEach((p, index) => {
-        if (p) {
-            p.hand = []; p.folded = false; p.hasDiscarded = false;
-            p.currentRoundBet = 0; p.hasActed = false;
-            // INCREMENT STATS & AWARD TIME BANK
-            p.handsPlayedTotal++;
-            if (p.handsPlayedTotal % 5 === 0) {
-                p.timeBanks++;
-                io.to(p.id).emit('message', `🔔 You earned a Time Bank! (${p.handsPlayedTotal} hands played)`);
-            }
-
-            if (gameState.riggedHands[index] && gameState.riggedHands[index].length > 0) {
-                const forcedCards = gameState.riggedHands[index];
-                forcedCards.forEach(cardCode => {
-                    const deckIdx = gameState.deck.indexOf(cardCode);
-                    if (deckIdx > -1) p.hand.push(gameState.deck.splice(deckIdx, 1)[0]);
-                });
-                delete gameState.riggedHands[index];
-            }
-            while(p.hand.length < 5) p.hand.push(gameState.deck.pop());
-            io.to(p.id).emit('yourHand', p.hand);
+        if (gameState.handsPlayed % 10 === 0) {
+            io.emit('chatMessage', { name: "🌪️ WEATHER", text: generateWeatherReport(), type: 'system' });
         }
-    });
 
-    const sbAmount = gameState.blindSettings.smallBlind;
-    const bbAmount = gameState.blindSettings.bigBlind;
-    let sbPos = getNextActiveSeat(gameState.dealerIndex);
-    let bbPos = getNextActiveSeat(sbPos);
-    
-    if (gameState.seats.filter(p => p).length === 2) {
-        sbPos = gameState.dealerIndex;
-        bbPos = getNextActiveSeat(sbPos);
+        let nextDealer = (gameState.dealerIndex + 1) % 4;
+        let loopCount = 0;
+        while(!gameState.seats[nextDealer] && loopCount < 4) {
+            nextDealer = (nextDealer + 1) % 4;
+            loopCount++;
+        }
+        gameState.dealerIndex = nextDealer;
+
+        gameState.seats.forEach((p, index) => {
+            if (p) {
+                p.hand = []; p.folded = false; p.hasDiscarded = false;
+                p.currentRoundBet = 0; p.hasActed = false;
+                p.handsPlayedTotal++;
+                
+                if (p.handsPlayedTotal % 5 === 0) {
+                    p.timeBanks++;
+                    io.to(p.id).emit('message', `🔔 You earned a Time Bank! (${p.handsPlayedTotal} hands played)`);
+                }
+
+                if (gameState.riggedHands[index] && gameState.riggedHands[index].length > 0) {
+                    const forcedCards = gameState.riggedHands[index];
+                    forcedCards.forEach(cardCode => {
+                        const deckIdx = gameState.deck.indexOf(cardCode);
+                        if (deckIdx > -1) p.hand.push(gameState.deck.splice(deckIdx, 1)[0]);
+                    });
+                    delete gameState.riggedHands[index];
+                }
+                
+                while(p.hand.length < 5) p.hand.push(gameState.deck.pop());
+                
+                handHistoryLog[gameState.handNumber].players[index] = {
+                    name: p.name,
+                    initialHand: [...p.hand],
+                    discards: [],
+                    finalHand: []
+                };
+
+                io.to(p.id).emit('yourHand', p.hand);
+            }
+        });
+
+        const sbAmount = gameState.blindSettings.smallBlind;
+        const bbAmount = gameState.blindSettings.bigBlind;
+        let sbPos = getNextActiveSeat(gameState.dealerIndex);
+        let bbPos = getNextActiveSeat(sbPos);
+        
+        if (gameState.seats.filter(p => p).length === 2) {
+            sbPos = gameState.dealerIndex;
+            bbPos = getNextActiveSeat(sbPos);
+        }
+
+        gameState.sbIndex = sbPos;
+        gameState.bbIndex = bbPos;
+        gameState.seats[sbPos].chips -= sbAmount;
+        gameState.seats[sbPos].currentRoundBet = sbAmount;
+        gameState.pot += sbAmount;
+        gameState.seats[bbPos].chips -= bbAmount;
+        gameState.seats[bbPos].currentRoundBet = bbAmount;
+        gameState.pot += bbAmount;
+
+        gameState.currentBet = bbAmount;
+        gameState.activeSeatIndex = getNextActiveSeat(bbPos);
+        
+        startTurnTimer(gameState.activeSeatIndex);
+
+        gameState.phase = 'betting';
+
+        io.emit('message', `Blinds: ${sbAmount} (Half Ear) / ${bbAmount} (Full Ear)`);
+        io.emit('updateState', publicState());
+        
+        updateHandStrengths();
+        console.log("[SERVER] Hand Started Successfully.");
+    } catch (e) {
+        console.error("[SERVER CRASH] startHand failed:", e);
     }
-
-    gameState.sbIndex = sbPos;
-    gameState.bbIndex = bbPos;
-    gameState.seats[sbPos].chips -= sbAmount;
-    gameState.seats[sbPos].currentRoundBet = sbAmount;
-    gameState.pot += sbAmount;
-    gameState.seats[bbPos].chips -= bbAmount;
-    gameState.seats[bbPos].currentRoundBet = bbAmount;
-    gameState.pot += bbAmount;
-
-    gameState.currentBet = bbAmount;
-    gameState.activeSeatIndex = getNextActiveSeat(bbPos);
-    
-    // START TIMER FOR FIRST ACTOR
-    startTurnTimer(gameState.activeSeatIndex);
-
-    gameState.phase = 'betting';
-
-    io.emit('message', `Blinds: ${sbAmount} (Half Ear) / ${bbAmount} (Full Ear)`);
-    io.emit('updateState', publicState());
-    
-    updateHandStrengths();
 }
 
 function startBettingRound() {
@@ -381,7 +494,7 @@ function startBettingRound() {
     gameState.currentBet = 0;
     gameState.seats.forEach(p => { if(p) { p.currentRoundBet = 0; p.hasActed = false; } });
     gameState.activeSeatIndex = getNextActiveSeat(gameState.dealerIndex);
-    startTurnTimer(gameState.activeSeatIndex); // START TIMER
+    startTurnTimer(gameState.activeSeatIndex);
     io.emit('updateState', publicState());
 }
 
@@ -393,6 +506,9 @@ function handleBettingAction(seatIndex, action) {
 
     if (type === 'fold') {
         p.folded = true;
+        if(handHistoryLog[gameState.handNumber] && handHistoryLog[gameState.handNumber].players[seatIndex]) {
+             handHistoryLog[gameState.handNumber].players[seatIndex].finalHand = ["FOLDED"];
+        }
         const active = gameState.seats.filter(p => p && !p.folded);
         if (active.length === 1) { handleShowdown(); return; }
     } else if (type === 'call') {
@@ -414,7 +530,7 @@ function handleBettingAction(seatIndex, action) {
     if (isBettingSettled()) advanceStreet();
     else {
         gameState.activeSeatIndex = getNextActiveSeat(gameState.activeSeatIndex);
-        startTurnTimer(gameState.activeSeatIndex); // START NEXT TIMER
+        startTurnTimer(gameState.activeSeatIndex);
         io.emit('updateState', publicState());
     }
 }
@@ -443,6 +559,11 @@ function advanceStreet() {
         handleShowdown(); return;
     }
     gameState.seats.forEach(p => { if(p) p.hasDiscarded = false; });
+    
+    if(handHistoryLog[gameState.handNumber]) {
+        handHistoryLog[gameState.handNumber].community = [...gameState.communityCards];
+    }
+
     io.emit('updateState', publicState());
     updateHandStrengths();
 }
@@ -458,9 +579,10 @@ function handleShowdown() {
     const winnings = gameState.pot - rake; 
 
     let jackpotWinnerName = null;
+    const handLabel = `[Hand #${gameState.handNumber}]`; 
 
     if (active.length === 1) {
-        gameState.winner = `${active[0].name} wins (folds)!`;
+        gameState.winner = `${handLabel} ${active[0].name} wins (folds)!`;
         active[0].chips += winnings;
     } else {
         const solved = active.map(p => ({ p: p, h: Hand.solve(p.hand.concat(gameState.communityCards)) }));
@@ -481,9 +603,18 @@ function handleShowdown() {
             io.emit('message', `🌽 ${jackpotWinnerName} HARVESTED THE JACKPOT! 🌽`);
             gameState.harvestJackpot = 0; 
         }
-        gameState.winner = `${winPlayers.map(w => w.p.name).join('&')} wins with ${winners[0].descr}`;
+        gameState.winner = `${handLabel} ${winPlayers.map(w => w.p.name).join('&')} wins with ${winners[0].descr}`;
     }
     
+    if(handHistoryLog[gameState.handNumber]) {
+        handHistoryLog[gameState.handNumber].winner = gameState.winner;
+        gameState.seats.forEach((p, index) => {
+            if(p && !p.folded && handHistoryLog[gameState.handNumber].players[index]) {
+                handHistoryLog[gameState.handNumber].players[index].finalHand = [...p.hand];
+            }
+        });
+    }
+
     gameState.timerStart = Date.now();
     gameState.timerDuration = HAND_INTERVAL_TIME;
     
@@ -512,7 +643,7 @@ function publicState() {
         winner: gameState.winner,
         readySeats: gameState.readySeats,
         timerLeft: Math.ceil(timeLeft),
-        turnDeadline: gameState.turnDeadline, // SEND DEADLINE
+        turnDeadline: gameState.turnDeadline,
         pot: gameState.pot,
         currentBet: gameState.currentBet,
         activeSeatIndex: gameState.activeSeatIndex,
@@ -521,13 +652,15 @@ function publicState() {
         bbIndex: gameState.bbIndex,
         blindSettings: gameState.blindSettings,
         harvestJackpot: gameState.harvestJackpot, 
-        harvestRake: gameState.harvestRake, 
+        harvestRake: gameState.harvestRake,
+        handNumber: gameState.handNumber, 
         seats: gameState.seats.map(p => {
             if(!p) return null;
             return {
                 name: p.name, chips: p.chips, currentRoundBet: p.currentRoundBet,
                 folded: p.folded, hasDiscarded: p.hasDiscarded, cardCount: p.hand.length,
-                timeBanks: p.timeBanks, // SEND BANKS
+                timeBanks: p.timeBanks,
+                isSittingOut: p.isSittingOut, 
                 hand: (gameState.street === 'showdown') ? p.hand : null 
             };
         })

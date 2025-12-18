@@ -4,12 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Iowa Hold'em</title>
-    <link rel="stylesheet" href="style.css?v=39">
+    <link rel="stylesheet" href="style.css?v=46">
     <script src="/socket.io/socket.io.js"></script>
     <script src="client.js" defer></script>
 </head>
 <body>
 
+    <div id="hand-counter">Hand #0</div>
     <button id="settings-btn" class="icon-btn">⚙️</button>
 
     <div id="lobby-screen">
@@ -44,26 +45,21 @@
 
         <div class="poker-table">
             <div id="tractor-token" class="tractor hidden">🚜</div>
-
             <div class="community-area"></div>
             <div id="seat-0" class="seat seat-bottom" data-index="0">Empty</div>
-            <div id="seat-1" class="seat seat-left" data-index="1">Empty</div>
-            <div id="seat-2" class="seat seat-top" data-index="2">Empty</div>
-            <div id="seat-3" class="seat seat-right" data-index="3">Empty</div>
+            <div id="seat-1" class="seat seat-left"   data-index="1">Empty</div>
+            <div id="seat-2" class="seat seat-top"    data-index="2">Empty</div>
+            <div id="seat-3" class="seat seat-right"  data-index="3">Empty</div>
         </div>
 
         <div id="player-dashboard">
-
             <div id="hand-strength-display" class="hidden"></div>
-
             <div id="my-hand-container" class="hand-area"></div>
-
             <div id="controls-area" class="controls-panel hidden">
                 <button id="time-bank-btn" class="hidden">⏰ +60s</button>
-
                 <div class="action-row">
-                    <button class="action-btn fold" id="btn-fold">FOLD</button>
-                    <button class="action-btn check" id="btn-check">CHECK</button>
+                    <button class="action-btn fold" id="btn-fold">FOLD (F)</button>
+                    <button class="action-btn check" id="btn-check">CHECK (SPC)</button>
                 </div>
                 <div class="bet-sizing-row">
                     <button class="bet-size-btn" id="btn-half-pot">1/2 Pot</button>
@@ -75,7 +71,6 @@
                     <button class="action-btn raise" id="btn-raise">RAISE</button>
                 </div>
             </div>
-
             <div id="pick-corn-container" class="hidden tooltip-container">
                 <button id="pick-corn-btn" style="background:#e65100; border:none; color:white; padding:10px; font-weight:bold; border-radius:5px; margin-left:10px; border:2px solid #FFD700; cursor:pointer;">🚜 Go Pick Corn</button>
                 <div class="tooltip-text">Skip a turn to harvest 5% of Jackpot (Min 200🌽)</div>
@@ -101,7 +96,7 @@
                 <em style="color:#FFD700;">Win with Quads, Straight Flush, or Royal Flush!</em>
             </div>
         </div>
-
+        
         <div id="weather-layer"></div>
 
     </div>
@@ -121,56 +116,78 @@
         <div class="modal-content">
             <h2>Enter Password</h2>
             <input type="password" id="admin-pass-input" placeholder="Passcode">
-            <div class="modal-buttons">
-                <button id="confirm-pass-btn" class="btn-primary">UNLOCK</button>
-                <button id="cancel-pass-btn" class="btn-secondary">CANCEL</button>
-            </div>
+            <div class="modal-buttons"><button id="confirm-pass-btn" class="btn-primary">UNLOCK</button><button id="cancel-pass-btn" class="btn-secondary">CANCEL</button></div>
+        </div>
+    </div>
+
+    <div id="broadcast-modal" class="modal hidden">
+        <div class="modal-content" style="border-color: #FF4500;">
+            <h1 style="color: #FF4500; font-size: 40px;">⚠️ ALERT ⚠️</h1>
+            <h2 id="broadcast-text" style="color: white;"></h2>
+            <button class="btn-primary" onclick="document.getElementById('broadcast-modal').classList.add('hidden')">OKAY</button>
+        </div>
+    </div>
+
+    <div id="history-modal" class="modal hidden">
+        <div class="modal-content" style="width: 600px; text-align: left; max-height: 80vh; overflow-y:auto;">
+            <h2 id="history-title" style="text-align:center;">Hand #? History</h2>
+            <div id="history-content" style="background:#333; padding:10px; border-radius:5px; font-size:14px; white-space: pre-wrap; color:#ddd;"></div>
+            <button class="btn-secondary" onclick="document.getElementById('history-modal').classList.add('hidden')" style="margin-top:10px; width:100%;">CLOSE</button>
         </div>
     </div>
 
     <div id="settings-modal" class="modal hidden">
         <div class="modal-content" style="width: 400px; text-align: left; max-height: 80vh; overflow-y:auto;">
             <h2 style="text-align:center; margin-bottom: 20px;">Settings</h2>
-
             <div class="settings-row"><span>Light Mode</span><label class="switch"><input type="checkbox" id="theme-toggle"><span class="slider round"></span></label></div>
             <div class="settings-row"><span>4-Color Deck</span><label class="switch"><input type="checkbox" id="toggle-four-color"><span class="slider round"></span></label></div>
             <div class="settings-row"><span>Show Stack in BB</span><label class="switch"><input type="checkbox" id="toggle-show-bb"><span class="slider round"></span></label></div>
+            <div class="settings-row"><span>Sit Out (Auto-Fold)</span><label class="switch"><input type="checkbox" id="toggle-sit-out"><span class="slider round"></span></label></div>
 
             <div id="admin-tools-area" class="hidden">
                 <hr style="border-color:#444; margin: 15px 0;">
-                <h3 id="admin-title-secret" style="color:#FFD700; text-align:center; cursor:default; user-select:none;">Admin Tools</h3>
-
+                <h3 id="admin-title-secret" style="color:#FFD700; text-align:center; cursor:pointer; user-select:none;">Admin Tools</h3>
+                
                 <h4 style="margin:5px 0;">Game Flow</h4>
+                <div style="display:flex; gap:10px;"><button id="btn-update-blinds" class="btn-primary btn-small" style="flex:1;">Set Blinds</button><button id="btn-force-new-hand" class="btn-secondary btn-small" style="flex:1; background:#e65100;">Force Next Hand</button></div>
+                <div style="display:flex; gap:5px; margin-top:5px;"><input type="number" id="admin-sb" placeholder="Half Ear" style="width:50%;"><input type="number" id="admin-bb" placeholder="Full Ear" style="width:50%;"></div>
+                
+                <h4 style="margin:10px 0 5px 0;">💬 Admin Chat</h4>
                 <div style="display:flex; gap:10px;">
-                    <button id="btn-update-blinds" class="btn-primary btn-small" style="flex:1;">Set Blinds</button>
-                    <button id="btn-force-new-hand" class="btn-secondary btn-small" style="flex:1; background:#e65100;">Force Next Hand</button>
+                    <input type="text" id="admin-chat-msg" placeholder="Message..." style="margin:0;">
+                    <button id="btn-admin-chat" class="btn-secondary btn-small" style="background:#d32f2f;">TALK</button>
                 </div>
-                <div style="display:flex; gap:5px; margin-top:5px;">
-                    <input type="number" id="admin-sb" placeholder="Half Ear" style="width:50%;">
-                    <input type="number" id="admin-bb" placeholder="Full Ear" style="width:50%;">
+
+                <h4 style="margin:10px 0 5px 0;">📢 Broadcast</h4>
+                <div style="display:flex; gap:10px;">
+                    <input type="text" id="admin-broadcast-msg" placeholder="Alert..." style="margin:0;">
+                    <button id="btn-broadcast" class="btn-secondary btn-small">SEND</button>
                 </div>
 
                 <h4 style="margin:10px 0 5px 0;">Harvest Settings</h4>
-                <div style="display:flex; gap:5px; align-items:center;">
-                    <input type="number" id="admin-harvest-amount" placeholder="Total" style="width:40%; margin:0;">
-                    <button id="btn-set-harvest" class="btn-secondary btn-small" style="width:20%;">SET</button>
-                    <input type="number" id="admin-rake-percent" placeholder="Rake %" style="width:20%; margin:0;">
-                    <button id="btn-set-rake" class="btn-secondary btn-small" style="width:20%;">%</button>
-                </div>
-
+                <div style="display:flex; gap:5px; align-items:center;"><input type="number" id="admin-harvest-amount" placeholder="Total" style="width:40%; margin:0;"><button id="btn-set-harvest" class="btn-secondary btn-small" style="width:20%;">SET</button><input type="number" id="admin-rake-percent" placeholder="Rake %" style="width:20%; margin:0;"><button id="btn-set-rake" class="btn-secondary btn-small" style="width:20%;">%</button></div>
+                
                 <h4 style="margin:10px 0 5px 0;">Chip Fairy</h4>
-                <div style="display:flex; gap:10px; margin-bottom: 5px;">
-                    <button id="btn-set-chips" class="btn-secondary btn-small" style="width:50%">RESET ALL</button>
-                    <input type="number" id="admin-chips" value="1000" placeholder="Amount" style="width:50%; margin:0;">
+                <div style="display:flex; gap:10px; margin-bottom: 5px;"><button id="btn-set-chips" class="btn-secondary btn-small" style="width:50%">RESET ALL</button><input type="number" id="admin-chips" value="1000" placeholder="Amount" style="width:50%; margin:0;"></div>
+                <div style="display:flex; gap:10px; align-items:center;"><select id="admin-player-select" style="width:50%; padding:10px; background:#333; color:white; border:none; border-radius:5px; outline:none;"></select><button id="btn-set-player-chips" class="btn-secondary btn-small" style="width:50%">SET PLAYER</button></div>
+                
+                <h4 style="margin:10px 0 5px 0;">📜 Hand History Lookup</h4>
+                <div style="display:flex; gap:10px;">
+                    <input type="number" id="admin-hist-id" placeholder="Hand #" style="margin:0;">
+                    <button id="btn-get-history" class="btn-secondary btn-small">FETCH</button>
                 </div>
-                <div style="display:flex; gap:10px; align-items:center;">
-                    <select id="admin-player-select" style="width:50%; padding:10px; background:#333; color:white; border:none; border-radius:5px; outline:none;"></select>
-                    <button id="btn-set-player-chips" class="btn-secondary btn-small" style="width:50%">SET PLAYER</button>
-                </div>
-
+                
                 <div id="god-mode-container" class="hidden">
                     <hr style="border-color:#ff5252; margin: 15px 0;">
                     <h4 style="margin:5px 0; color:#ff5252; text-align:center;">GOD MODE</h4>
+                    
+                    <h4 style="margin:10px 0 5px 0;">🕵️ Peek Player Hand</h4>
+                    <div style="display:flex; gap:10px; align-items:center; margin-bottom:15px;">
+                        <select id="peek-player-select" style="width:70%; padding:10px; background:#333; color:white; border:none; border-radius:5px; outline:none;"></select>
+                        <button id="btn-peek" class="btn-secondary btn-small" style="width:30%">PEEK</button>
+                    </div>
+
+                    <h4 style="margin:10px 0 5px 0; color:#aaa;">Card Swapper</h4>
                     <div style="display:flex; gap:5px; margin-bottom:10px;">
                         <select id="rig-player-select" style="width:40%; padding:5px; background:#333; color:white;"></select>
                         <input type="text" id="rig-cards-input" placeholder="Ah Ks" style="flex:1; margin:0;">
@@ -178,7 +195,7 @@
                     </div>
                     <div id="god-mode-area"></div>
                 </div>
-
+                
                 <h4 style="margin:10px 0 5px 0;">Active Players (Kick)</h4>
                 <div id="admin-player-list" style="max-height: 100px; overflow-y: auto; background: #333; padding: 10px; border-radius: 5px;"></div>
             </div>
