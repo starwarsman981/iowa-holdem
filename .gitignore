@@ -1,0 +1,5 @@
+node_modules/
+.vs/
+*.sln
+*.suo
+.DS_Store
